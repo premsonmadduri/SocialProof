@@ -1,0 +1,6 @@
+{
+  "name": "Social Proof",
+  "description": "Real-time community supporters showcase for Dasam Baby Venkatesh.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,111 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny all paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reusable hardened primitives
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidDeviceId(id) {
+      return id is string && id.size() >= 8 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isDesignatedCampaign(campaignId) {
+      return isValidId(campaignId) && campaignId == 'dasam-baby-venkatesh';
+    }
+
+    // Validation Blueprint for Campaign (Anti-Update-Gap)
+    function isValidCampaign(data) {
+      return data.keys().hasAll(['title', 'supportersCount', 'lastDeviceId', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['title', 'supportersCount', 'lastDeviceId', 'createdAt', 'updatedAt'])
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 100
+        && data.title == 'దాసం బేబీ వెంకటేష్'
+        && data.supportersCount is int
+        && data.supportersCount >= 1
+        && data.supportersCount <= 100000000
+        && isValidDeviceId(data.lastDeviceId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint for Member (One record per device)
+    function isValidMember(data, deviceId) {
+      return data.keys().hasAll(['deviceId', 'joinedAt'])
+        && data.keys().hasOnly(['deviceId', 'joinedAt'])
+        && isValidDeviceId(data.deviceId)
+        && data.deviceId == deviceId
+        && data.joinedAt is timestamp;
+    }
+
+    // Action-based update guard: strictly +1 increment coupled atomically with a new member device doc
+    function isUniqueDeviceJoinAction(campaignId) {
+      return incoming().diff(existing()).affectedKeys().hasOnly(['supportersCount', 'updatedAt', 'lastDeviceId'])
+        && incoming().title == existing().title
+        && incoming().createdAt == existing().createdAt
+        && incoming().supportersCount == existing().supportersCount + 1
+        && incoming().updatedAt == request.time
+        && !exists(/databases/$(database)/documents/campaigns/$(campaignId)/members/$(incoming().lastDeviceId))
+        && existsAfter(/databases/$(database)/documents/campaigns/$(campaignId)/members/$(incoming().lastDeviceId));
+    }
+
+    match /campaigns/{campaignId} {
+      // Single-document read only for the designated public campaign
+      allow get: if isDesignatedCampaign(campaignId);
+
+      // Explicitly block collection scraping
+      allow list: if false;
+
+      // Bootstrap create only when paired atomically with first member record
+      allow create: if isDesignatedCampaign(campaignId)
+        && isValidCampaign(incoming())
+        && incoming().supportersCount == 1
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && !exists(/databases/$(database)/documents/campaigns/$(campaignId)/members/$(incoming().lastDeviceId))
+        && existsAfter(/databases/$(database)/documents/campaigns/$(campaignId)/members/$(incoming().lastDeviceId));
+
+      // Action-based update: strict +1 join increment validated atomically against members/{deviceId}
+      allow update: if isDesignatedCampaign(campaignId)
+        && isValidCampaign(incoming())
+        && isUniqueDeviceJoinAction(campaignId);
+
+      // Never allow deletion of the campaign counter
+      allow delete: if false;
+
+      match /members/{deviceId} {
+        // A device may only check its own membership document by exact ID
+        allow get: if isDesignatedCampaign(campaignId) && isValidDeviceId(deviceId);
+
+        // Explicitly block listing/scraping all member devices
+        allow list: if false;
+
+        // Allow creating a device membership once, atomically coupled to the campaign counter update
+        allow create: if isDesignatedCampaign(campaignId)
+          && isValidDeviceId(deviceId)
+          && isValidMember(incoming(), deviceId)
+          && incoming().joinedAt == request.time
+          && existsAfter(/databases/$(database)/documents/campaigns/$(campaignId))
+          && getAfter(/databases/$(database)/documents/campaigns/$(campaignId)).data.lastDeviceId == deviceId;
+
+        // Immutable once joined: no updates or deletions
+        allow update, delete: if false;
+      }
+    }
+  }
+}

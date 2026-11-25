@@ -1,0 +1,73 @@
+{
+  "entities": {
+    "Campaign": {
+      "title": "Campaign",
+      "description": "Public real-time community counter for Dasam Baby Venkatesh.",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Display title of the campaign in Telugu.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "supportersCount": {
+          "type": "integer",
+          "description": "Total real-time count of unique community member devices."
+        },
+        "lastDeviceId": {
+          "type": "string",
+          "description": "Device identifier of the most recent atomic join.",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the campaign document was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest community join."
+        }
+      },
+      "required": ["title", "supportersCount", "lastDeviceId", "createdAt", "updatedAt"]
+    },
+    "Member": {
+      "title": "Member",
+      "description": "Per-device membership record enforcing one join per device.",
+      "type": "object",
+      "properties": {
+        "deviceId": {
+          "type": "string",
+          "description": "Unique sanitized device identifier matching the document ID.",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "joinedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when this device joined the community."
+        }
+      },
+      "required": ["deviceId", "joinedAt"]
+    }
+  },
+  "firestore": {
+    "/campaigns/{campaignId}": {
+      "schema": {
+        "$ref": "#/entities/Campaign"
+      },
+      "description": "Stores the real-time community member count for the Dasam Baby Venkatesh campaign."
+    },
+    "/campaigns/{campaignId}/members/{deviceId}": {
+      "schema": {
+        "$ref": "#/entities/Member"
+      },
+      "description": "Tracks each device that has joined the community to enforce single join per device."
+    }
+  }
+}
