@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   doc,
   onSnapshot,
@@ -14,12 +14,18 @@ import {
   MEMBERS_SUBCOLLECTION,
   OperationType,
   db,
-  getOrCreateDeviceId,
   handleFirestoreError,
 } from './firebase';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ScissorLogo } from './components/ScissorLogo';
 import { ThankYouModal } from './components/ThankYouModal';
+import {
+  type DeviceIdentity,
+  clearJoinedLocally,
+  persistJoinedLocally,
+  readCachedJoinedSync,
+  resolveDeviceIdentity,
+} from './utils/deviceIdentity';
 
 const PORTRAIT_IMAGE_SRC = '/assets/aistudio/IMG_6823_c5503f94.PNG';
 const PORTRAIT_BG_SRC = '/assets/aistudio/IMG_6825.JPG_cff378fb.jpeg';
@@ -51,11 +57,13 @@ const UPCOMING_PLANS_TELUGU = [
 
 function SocialProofApp() {
   const prefersReducedMotion = useReducedMotion();
-  const deviceId = useMemo(() => getOrCreateDeviceId(), []);
+  const [deviceIdentity, setDeviceIdentity] = useState<DeviceIdentity | null>(null);
   const [supportersCount, setSupportersCount] = useState<number>(0);
   const [isLoadingCount, setIsLoadingCount] = useState<boolean>(true);
-  const [hasJoined, setHasJoined] = useState<boolean>(false);
-  const [isCheckingMember, setIsCheckingMember] = useState<boolean>(true);
+  const [hasJoined, setHasJoined] = useState<boolean>(() => readCachedJoinedSync());
+  const [isCheckingMember, setIsCheckingMember] = useState<boolean>(
+    () => !readCachedJoinedSync()
+  );
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [showThankYou, setShowThankYou] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -145,27 +153,77 @@ function SocialProofApp() {
     return () => unsubscribe();
   }, []);
 
-  // Real-time Firestore listener for this device's membership status (enforces 1 join per device)
+  // Resolve deterministic device fingerprint + multi-storage identity (localStorage, cookie, IndexedDB)
   useEffect(() => {
-    const memberPath = `${CAMPAIGN_COLLECTION}/${CAMPAIGN_DOC_ID}/${MEMBERS_SUBCOLLECTION}/${deviceId}`;
-    const memberRef = doc(
+    let active = true;
+    resolveDeviceIdentity()
+      .then((resolved) => {
+        if (!active) return;
+        setDeviceIdentity(resolved);
+        if (resolved.cachedJoined) {
+          setHasJoined(true);
+          setIsCheckingMember(false);
+        }
+      })
+      .catch(() => {
+        if (!active) return;
+        setIsCheckingMember(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Real-time Firestore listener for this device's membership status (checks fingerprint + any legacy ID)
+  useEffect(() => {
+    if (!deviceIdentity) return;
+
+    const { primaryId, legacyId } = deviceIdentity;
+    let primaryLoaded = false;
+    let legacyLoaded = !legacyId;
+    let primaryExists = false;
+    let legacyExists = false;
+    let primaryFromServer = false;
+    let legacyFromServer = !legacyId;
+
+    const syncMembership = () => {
+      if (primaryExists || legacyExists) {
+        setHasJoined(true);
+        setIsCheckingMember(false);
+        void persistJoinedLocally(primaryId);
+        return;
+      }
+
+      if (primaryLoaded && legacyLoaded) {
+        setIsCheckingMember(false);
+        if (primaryFromServer && legacyFromServer) {
+          setHasJoined(false);
+          void clearJoinedLocally();
+        }
+      }
+    };
+
+    const primaryPath = `${CAMPAIGN_COLLECTION}/${CAMPAIGN_DOC_ID}/${MEMBERS_SUBCOLLECTION}/${primaryId}`;
+    const primaryRef = doc(
       db,
       CAMPAIGN_COLLECTION,
       CAMPAIGN_DOC_ID,
       MEMBERS_SUBCOLLECTION,
-      deviceId
+      primaryId
     );
 
-    const unsubscribe = onSnapshot(
-      memberRef,
+    const unsubPrimary = onSnapshot(
+      primaryRef,
       (snapshot) => {
-        setHasJoined(snapshot.exists());
-        setIsCheckingMember(false);
+        primaryLoaded = true;
+        primaryExists = snapshot.exists();
+        primaryFromServer = !snapshot.metadata.fromCache;
+        syncMembership();
       },
       (error) => {
         setIsCheckingMember(false);
         try {
-          handleFirestoreError(error, OperationType.GET, memberPath);
+          handleFirestoreError(error, OperationType.GET, primaryPath);
         } catch (wrapped) {
           setFatalError(
             wrapped instanceof Error ? wrapped : new Error(String(wrapped))
@@ -174,48 +232,97 @@ function SocialProofApp() {
       }
     );
 
-    return () => unsubscribe();
-  }, [deviceId]);
+    let unsubLegacy: (() => void) | null = null;
+    if (legacyId) {
+      const legacyPath = `${CAMPAIGN_COLLECTION}/${CAMPAIGN_DOC_ID}/${MEMBERS_SUBCOLLECTION}/${legacyId}`;
+      const legacyRef = doc(
+        db,
+        CAMPAIGN_COLLECTION,
+        CAMPAIGN_DOC_ID,
+        MEMBERS_SUBCOLLECTION,
+        legacyId
+      );
+
+      unsubLegacy = onSnapshot(
+        legacyRef,
+        (snapshot) => {
+          legacyLoaded = true;
+          legacyExists = snapshot.exists();
+          legacyFromServer = !snapshot.metadata.fromCache;
+          syncMembership();
+        },
+        (error) => {
+          legacyLoaded = true;
+          legacyFromServer = true;
+          syncMembership();
+          try {
+            handleFirestoreError(error, OperationType.GET, legacyPath);
+          } catch {
+            // Non-fatal fallback for legacy device ID check
+          }
+        }
+      );
+    }
+
+    return () => {
+      unsubPrimary();
+      unsubLegacy?.();
+    };
+  }, [deviceIdentity]);
 
   const handleJoinCommunity = useCallback(async () => {
-    if (isSubmitting || isCheckingMember) return;
-
     // Already joined from this device: open Thank You / Share card popup without incrementing
     if (hasJoined) {
       setShowThankYou(true);
       return;
     }
 
+    if (isSubmitting || isCheckingMember || !deviceIdentity) return;
+
+    const { primaryId, legacyId } = deviceIdentity;
     setIsSubmitting(true);
     setActionError(null);
 
     const campaignPath = `${CAMPAIGN_COLLECTION}/${CAMPAIGN_DOC_ID}`;
     const campaignRef = doc(db, CAMPAIGN_COLLECTION, CAMPAIGN_DOC_ID);
-    const memberRef = doc(
+    const primaryMemberRef = doc(
       db,
       CAMPAIGN_COLLECTION,
       CAMPAIGN_DOC_ID,
       MEMBERS_SUBCOLLECTION,
-      deviceId
+      primaryId
     );
+    const legacyMemberRef = legacyId
+      ? doc(
+          db,
+          CAMPAIGN_COLLECTION,
+          CAMPAIGN_DOC_ID,
+          MEMBERS_SUBCOLLECTION,
+          legacyId
+        )
+      : null;
 
     try {
       const result = await runTransaction(db, async (transaction) => {
-        const [memberSnapshot, campaignSnapshot] = await Promise.all([
-          transaction.get(memberRef),
-          transaction.get(campaignRef),
-        ]);
+        const [primarySnapshot, campaignSnapshot, legacySnapshot] =
+          await Promise.all([
+            transaction.get(primaryMemberRef),
+            transaction.get(campaignRef),
+            legacyMemberRef
+              ? transaction.get(legacyMemberRef)
+              : Promise.resolve(null),
+          ]);
 
-        // Guard against race conditions / duplicate tabs on the same device
-        if (memberSnapshot.exists()) {
+        // Guard against race conditions, duplicate tabs, or cleared storage on the same phone
+        if (primarySnapshot.exists() || legacySnapshot?.exists()) {
           const existingCount = campaignSnapshot.exists()
             ? Number(campaignSnapshot.data()?.supportersCount ?? 0)
             : 0;
           return { alreadyJoined: true, count: existingCount };
         }
 
-        transaction.set(memberRef, {
-          deviceId,
+        transaction.set(primaryMemberRef, {
+          deviceId: primaryId,
           joinedAt: serverTimestamp(),
         });
 
@@ -223,7 +330,7 @@ function SocialProofApp() {
           transaction.set(campaignRef, {
             title: CAMPAIGN_TITLE_TELUGU,
             supportersCount: 1,
-            lastDeviceId: deviceId,
+            lastDeviceId: primaryId,
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
           });
@@ -242,13 +349,14 @@ function SocialProofApp() {
 
         transaction.update(campaignRef, {
           supportersCount: updatedCount,
-          lastDeviceId: deviceId,
+          lastDeviceId: primaryId,
           updatedAt: serverTimestamp(),
         });
 
         return { alreadyJoined: false, count: updatedCount };
       });
 
+      void persistJoinedLocally(primaryId);
       setSupportersCount(result.count);
       setHasJoined(true);
       setShowThankYou(true);
@@ -271,7 +379,7 @@ function SocialProofApp() {
     } finally {
       setIsSubmitting(false);
     }
-  }, [deviceId, hasJoined, isCheckingMember, isSubmitting]);
+  }, [deviceIdentity, hasJoined, isCheckingMember, isSubmitting]);
 
   return (
     <div className="min-h-dvh bg-[#FBFBFD] text-[#1D1D1F] selection:bg-[#0071E3]/15 selection:text-[#0071E3]">

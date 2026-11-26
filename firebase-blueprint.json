@@ -17,7 +17,7 @@
         },
         "lastDeviceId": {
           "type": "string",
-          "description": "Device identifier of the most recent atomic join.",
+          "description": "Deterministic device fingerprint ID (fp_<hash>) or legacy device ID of the most recent atomic join.",
           "minLength": 8,
           "maxLength": 64,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
@@ -42,7 +42,7 @@
       "properties": {
         "deviceId": {
           "type": "string",
-          "description": "Unique sanitized device identifier matching the document ID.",
+          "description": "Unique sanitized deterministic device fingerprint (fp_<hash>) or legacy device ID matching the document ID.",
           "minLength": 8,
           "maxLength": 64,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
